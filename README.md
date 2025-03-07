@@ -1,0 +1,2 @@
+# gtarfile
+like python tarfile
