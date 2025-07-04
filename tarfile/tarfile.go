@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,32 +20,36 @@ import (
 
 // TarFile provides an interface to tar archives.
 type TarFile struct {
-	Debug            int                                      // Debug level (0 to 3)
-	Dereference      bool                                     // Follow symlinks if true
-	IgnoreZeros      bool                                     // Skip empty/invalid blocks if true
-	ErrorLevel       int                                      // Error reporting level
-	Format           int                                      // Archive format (DEFAULT_FORMAT, USTAR_FORMAT, etc.)
-	Encoding         string                                   // Encoding for 8-bit strings
-	Errors           string                                   // Error handler for unicode conversion
-	TarInfo          func() *TarInfo                          // Factory for TarInfo objects
-	FileObject       func(*TarFile, *TarInfo) *ExFileObject   // Factory for file objects
-	ExtractionFilter func(*TarInfo, string) (*TarInfo, error) // Filter for extraction
+	// 私有字段，提供更好的封装
+	debug            int                                      // Debug level (0 to 3)
+	dereference      bool                                     // Follow symlinks if true
+	ignoreZeros      bool                                     // Skip empty/invalid blocks if true
+	errorLevel       int                                      // Error reporting level
+	format           int                                      // Archive format (DEFAULT_FORMAT, USTAR_FORMAT, etc.)
+	encoding         string                                   // Encoding for 8-bit strings
+	errors           string                                   // Error handler for unicode conversion
+	tarInfo          func() *TarInfo                          // Factory for TarInfo objects
+	fileObject       func(*TarFile, *TarInfo) *ExFileObject   // Factory for file objects
+	extractionFilter func(*TarInfo, string) (*TarInfo, error) // Filter for extraction
 
-	Name       string             // Path to the tar file
-	Mode       string             // "r", "a", "w", "x"
+	name       string             // Path to the tar file
+	mode       string             // "r", "a", "w", "x"
 	fileMode   string             // Underlying file mode ("rb", "r+b", etc.)
-	FileObj    io.ReadWriteSeeker // File object for reading/writing
-	Stream     bool               // Treat as a stream if true
-	ExtFileObj bool               // True if FileObj is externally provided
-	PaxHeaders map[string]string  // PAX headers
+	fileObj    io.ReadWriteSeeker // File object for reading/writing
+	stream     bool               // Treat as a stream if true
+	extFileObj bool               // True if FileObj is externally provided
+	paxHeaders map[string]string  // PAX headers
 
-	CopyBufSize int                  // Buffer size for copying
-	Closed      bool                 // Whether the archive is closed
-	Members     []*TarInfo           // List of members
-	Loaded      bool                 // Whether all members are loaded
-	Offset      int64                // Current position in the archive
-	Inodes      map[[2]uint64]string // Cache of inodes for hard links
-	FirstMember *TarInfo             // First member for iteration
+	copyBufSize int                  // Buffer size for copying
+	closed      bool                 // Whether the archive is closed
+	members     []*TarInfo           // List of members
+	loaded      bool                 // Whether all members are loaded
+	offset      int64                // Current position in the archive
+	inodes      map[[2]uint64]string // Cache of inodes for hard links
+	firstMember *TarInfo             // First member for iteration
+
+	// 添加互斥锁保证并发安全
+	mu sync.RWMutex
 }
 
 // NewTarFile initializes a new TarFile instance.
@@ -56,18 +61,19 @@ func NewTarFile(name, mode string, fileobj io.ReadWriteSeeker, opts ...TarFileOp
 	}
 
 	tf := &TarFile{
-		Debug:       0,
-		Dereference: false,
-		IgnoreZeros: false,
-		ErrorLevel:  1,
-		Format:      DEFAULT_FORMAT,
-		Encoding:    ENCODING,
-		Errors:      "surrogateescape",
-		TarInfo:     func() *TarInfo { return NewTarInfo("") },
-		FileObject:  func(tf *TarFile, ti *TarInfo) *ExFileObject { return NewExFileObject(tf, ti) },
-		PaxHeaders:  make(map[string]string),
-		Mode:        mode,
+		debug:       0,
+		dereference: false,
+		ignoreZeros: false,
+		errorLevel:  1,
+		format:      DEFAULT_FORMAT,
+		encoding:    ENCODING,
+		errors:      "surrogateescape",
+		tarInfo:     func() *TarInfo { return NewTarInfo("") },
+		fileObject:  func(tf *TarFile, ti *TarInfo) *ExFileObject { return NewExFileObject(tf, ti) },
+		paxHeaders:  make(map[string]string),
+		mode:        mode,
 		fileMode:    fileMode,
+		inodes:      make(map[[2]uint64]string),
 	}
 
 	// Apply options
@@ -76,19 +82,19 @@ func NewTarFile(name, mode string, fileobj io.ReadWriteSeeker, opts ...TarFileOp
 	}
 
 	if fileobj == nil {
-		if tf.Mode == "a" && !fileExists(name) {
-			tf.Mode = "w"
+		if tf.mode == "a" && !fileExists(name) {
+			tf.mode = "w"
 			tf.fileMode = "wb"
 		}
 		f, err := os.OpenFile(name, osMode(tf.fileMode), 0666)
 		if err != nil {
 			return nil, err
 		}
-		tf.FileObj = f
-		tf.ExtFileObj = false
+		tf.fileObj = f
+		tf.extFileObj = false
 	} else {
-		tf.FileObj = fileobj
-		tf.ExtFileObj = true
+		tf.fileObj = fileobj
+		tf.extFileObj = true
 		if name == "" {
 			if n, ok := fileobj.(interface{ Name() string }); ok {
 				name = n.Name()
@@ -100,31 +106,30 @@ func NewTarFile(name, mode string, fileobj io.ReadWriteSeeker, opts ...TarFileOp
 		if err != nil {
 			return nil, err
 		}
-		tf.Name = abs
+		tf.name = abs
 	}
 
-	tf.Offset = tell(tf.FileObj)
-	tf.Inodes = make(map[[2]uint64]string)
+	tf.offset = tell(tf.fileObj)
 
 	// Initialize based on mode
 	var err error
-	switch tf.Mode {
+	switch tf.mode {
 	case "r":
-		tf.FirstMember, err = tf.Next()
+		tf.firstMember, err = tf.Next()
 		if err != nil {
 			tf.Close()
 			return nil, err
 		}
 	case "a":
 		for {
-			if _, err := tf.FileObj.Seek(tf.Offset, io.SeekStart); err != nil {
+			if _, err := tf.fileObj.Seek(tf.offset, io.SeekStart); err != nil {
 				tf.Close()
 				return nil, err
 			}
-			ti, err := tf.TarInfo().FromTarFile(tf)
+			ti, err := tf.tarInfo().FromTarFile(tf)
 			if err != nil {
 				if _, ok := err.(*EOFHeaderError); ok {
-					if _, err := tf.FileObj.Seek(tf.Offset, io.SeekStart); err != nil {
+					if _, err := tf.fileObj.Seek(tf.offset, io.SeekStart); err != nil {
 						tf.Close()
 						return nil, err
 					}
@@ -133,21 +138,21 @@ func NewTarFile(name, mode string, fileobj io.ReadWriteSeeker, opts ...TarFileOp
 				tf.Close()
 				return nil, NewReadError(err.Error())
 			}
-			tf.Members = append(tf.Members, ti)
+			tf.members = append(tf.members, ti)
 		}
 	case "w", "x":
-		tf.Loaded = true
-		if len(tf.PaxHeaders) > 0 {
-			buf, err := tf.TarInfo().CreatePaxGlobalHeader(tf.PaxHeaders)
+		tf.loaded = true
+		if len(tf.paxHeaders) > 0 {
+			buf, err := tf.tarInfo().CreatePaxGlobalHeader(tf.paxHeaders)
 			if err != nil {
 				tf.Close()
 				return nil, err
 			}
-			if _, err := tf.FileObj.Write(buf); err != nil {
+			if _, err := tf.fileObj.Write(buf); err != nil {
 				tf.Close()
 				return nil, err
 			}
-			tf.Offset += int64(len(buf))
+			tf.offset += int64(len(buf))
 		}
 	}
 
@@ -159,22 +164,22 @@ type TarFileOption func(*TarFile)
 
 // WithFormat sets the archive format.
 func WithFormat(format int) TarFileOption {
-	return func(tf *TarFile) { tf.Format = format }
+	return func(tf *TarFile) { tf.format = format }
 }
 
 // WithEncoding sets the encoding.
 func WithEncoding(encoding string) TarFileOption {
-	return func(tf *TarFile) { tf.Encoding = encoding }
+	return func(tf *TarFile) { tf.encoding = encoding }
 }
 
 // WithErrors sets the error handler.
 func WithErrors(errors string) TarFileOption {
-	return func(tf *TarFile) { tf.Errors = errors }
+	return func(tf *TarFile) { tf.errors = errors }
 }
 
 // WithPaxHeaders sets the PAX headers.
 func WithPaxHeaders(headers map[string]string) TarFileOption {
-	return func(tf *TarFile) { tf.PaxHeaders = headers }
+	return func(tf *TarFile) { tf.paxHeaders = headers }
 }
 
 // Open opens a tar archive with the specified mode and compression.
@@ -211,12 +216,12 @@ func Open(name, mode string, fileobj io.ReadWriteSeeker, bufsize int, opts ...Ta
 		if err != nil {
 			return nil, err
 		}
-		tf, err := NewTarFile(name, filemode, stream, append(opts, func(tf *TarFile) { tf.Stream = true })...)
+		tf, err := NewTarFile(name, filemode, stream, append(opts, func(tf *TarFile) { tf.stream = true })...)
 		if err != nil {
 			stream.Close()
 			return nil, err
 		}
-		tf.ExtFileObj = false
+		tf.extFileObj = false
 		return tf, nil
 
 	case mode == "a" || mode == "w" || mode == "x":
@@ -283,27 +288,27 @@ func (rws *readWriteSeeker) Seek(offset int64, whence int) (int64, error) {
 
 // Close closes the TarFile.
 func (tf *TarFile) Close() error {
-	if tf.Closed {
+	if tf.closed {
 		return nil
 	}
-	tf.Closed = true
+	tf.closed = true
 	defer func() {
-		if !tf.ExtFileObj {
-			if f, ok := tf.FileObj.(*os.File); ok {
+		if !tf.extFileObj {
+			if f, ok := tf.fileObj.(*os.File); ok {
 				f.Close()
 			}
 		}
 	}()
 
-	if tf.Mode == "a" || tf.Mode == "w" || tf.Mode == "x" {
-		_, err := tf.FileObj.Write(make([]byte, BLOCKSIZE*2)) // Two zero blocks
+	if tf.mode == "a" || tf.mode == "w" || tf.mode == "x" {
+		_, err := tf.fileObj.Write(make([]byte, BLOCKSIZE*2)) // Two zero blocks
 		if err != nil {
 			return err
 		}
-		tf.Offset += BLOCKSIZE * 2
-		_, remainder := divmod(tf.Offset, RECORDSIZE)
+		tf.offset += BLOCKSIZE * 2
+		_, remainder := divmod(tf.offset, RECORDSIZE)
 		if remainder > 0 {
-			_, err = tf.FileObj.Write(make([]byte, RECORDSIZE-remainder))
+			_, err = tf.fileObj.Write(make([]byte, RECORDSIZE-remainder))
 			if err != nil {
 				return err
 			}
@@ -314,21 +319,30 @@ func (tf *TarFile) Close() error {
 
 // GetMember returns a TarInfo object for the named member.
 func (tf *TarFile) GetMember(name string) (*TarInfo, error) {
-	tf.check("")
-	ti := tf.getMember(strings.TrimSuffix(name, "/"))
-	if ti == nil {
-		return nil, fmt.Errorf("filename %q not found", name)
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+
+	tf.check("r")
+	tarinfo := tf.getMember(name)
+	if tarinfo == nil {
+		return nil, fmt.Errorf("member %q not found", name)
 	}
-	return ti, nil
+	return tarinfo, nil
 }
 
 // GetMembers returns all members as a list of TarInfo objects.
 func (tf *TarFile) GetMembers() ([]*TarInfo, error) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+
 	tf.check("")
-	if !tf.Loaded {
+	if !tf.loaded {
 		tf.load()
 	}
-	return tf.Members, nil
+	// 返回副本避免外部修改
+	result := make([]*TarInfo, len(tf.members))
+	copy(result, tf.members)
+	return result, nil
 }
 
 // GetNames returns the names of all members.
@@ -356,10 +370,10 @@ func (tf *TarFile) GetTarInfo(name, arcname string, fileobj *os.File) (*TarInfo,
 	arcname = strings.ReplaceAll(arcname, string(os.PathSeparator), "/")
 	arcname = strings.TrimPrefix(arcname, "/")
 
-	ti := tf.TarInfo()
+	ti := tf.tarInfo()
 	var stat syscall.Stat_t
 	if fileobj == nil {
-		if tf.Dereference {
+		if tf.dereference {
 			err := syscall.Stat(name, &stat)
 			if err != nil {
 				return nil, err
@@ -381,13 +395,13 @@ func (tf *TarFile) GetTarInfo(name, arcname string, fileobj *os.File) (*TarInfo,
 	inode := [2]uint64{stat.Ino, stat.Dev} // 改为 uint64
 	switch {
 	case stat.Mode&syscall.S_IFMT == syscall.S_IFREG:
-		if !tf.Dereference && stat.Nlink > 1 && tf.Inodes[inode] != "" && arcname != tf.Inodes[inode] {
+		if !tf.dereference && stat.Nlink > 1 && tf.inodes[inode] != "" && arcname != tf.inodes[inode] {
 			ti.Type = LNKTYPE
-			linkname = tf.Inodes[inode]
+			linkname = tf.inodes[inode]
 		} else {
 			ti.Type = REGTYPE
 			if stat.Ino != 0 {
-				tf.Inodes[inode] = arcname
+				tf.inodes[inode] = arcname
 			}
 		}
 	case stat.Mode&syscall.S_IFMT == syscall.S_IFDIR:
@@ -434,7 +448,7 @@ func (tf *TarFile) Add(name, arcname string, recursive bool, filter func(*TarInf
 	if arcname == "" {
 		arcname = name
 	}
-	if tf.Name != "" && filepath.Clean(name) == tf.Name {
+	if tf.name != "" && filepath.Clean(name) == tf.name {
 		tf.dbg(2, fmt.Sprintf("tarfile: Skipped %q", name))
 		return nil
 	}
@@ -498,100 +512,40 @@ func (tf *TarFile) AddFile(tarinfo *TarInfo, fileobj io.Reader) error {
 	}
 
 	ti := tarinfo // Shallow copy in Go (struct is copied)
-	buf, err := ti.ToBuf(tf.Format, tf.Encoding, tf.Errors)
+	buf, err := ti.ToBuf(tf.format, tf.encoding, tf.errors)
 	if err != nil {
 		return err
 	}
-	if _, err := tf.FileObj.Write(buf); err != nil {
+	if _, err := tf.fileObj.Write(buf); err != nil {
 		return err
 	}
-	tf.Offset += int64(len(buf))
+	tf.offset += int64(len(buf))
 
 	if fileobj != nil {
-		if _, err := io.CopyN(tf.FileObj, fileobj, ti.Size); err != nil {
+		if _, err := io.CopyN(tf.fileObj, fileobj, ti.Size); err != nil {
 			return err
 		}
 		blocks, remainder := divmod(ti.Size, BLOCKSIZE)
 		if remainder > 0 {
-			_, err := tf.FileObj.Write(make([]byte, BLOCKSIZE-remainder))
+			_, err := tf.fileObj.Write(make([]byte, BLOCKSIZE-remainder))
 			if err != nil {
 				return err
 			}
 			blocks++
 		}
-		tf.Offset += blocks * BLOCKSIZE
+		tf.offset += blocks * BLOCKSIZE
 	}
 
-	tf.Members = append(tf.Members, ti)
+	tf.members = append(tf.members, ti)
 	return nil
 }
 
 // Next returns the next member of the archive.
 func (tf *TarFile) Next() (*TarInfo, error) {
-	tf.check("ra")
-	if tf.FirstMember != nil {
-		m := tf.FirstMember
-		tf.FirstMember = nil
-		return m, nil
-	}
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
 
-	if tf.Offset != tell(tf.FileObj) {
-		if tf.Offset == 0 {
-			return nil, nil
-		}
-		if _, err := tf.FileObj.Seek(tf.Offset-1, io.SeekStart); err != nil {
-			return nil, err
-		}
-		b := make([]byte, 1)
-		if _, err := tf.FileObj.Read(b); err != nil {
-			return nil, NewReadError("unexpected end of data")
-		}
-	}
-
-	var tarinfo *TarInfo
-	for {
-		ti, err := tf.TarInfo().FromTarFile(tf)
-		if err != nil {
-			switch e := err.(type) {
-			case *EOFHeaderError:
-				if tf.IgnoreZeros {
-					tf.dbg(2, fmt.Sprintf("0x%X: %s", tf.Offset, e))
-					tf.Offset += BLOCKSIZE
-					continue
-				}
-			case *InvalidHeaderError:
-				if tf.IgnoreZeros {
-					tf.dbg(2, fmt.Sprintf("0x%X: %s", tf.Offset, e))
-					tf.Offset += BLOCKSIZE
-					continue
-				}
-				if tf.Offset == 0 {
-					return nil, NewReadError(e.Error())
-				}
-			case *EmptyHeaderError:
-				if tf.Offset == 0 {
-					return nil, NewReadError("empty file")
-				}
-			case *TruncatedHeaderError:
-				if tf.Offset == 0 {
-					return nil, NewReadError(e.Error())
-				}
-			case *SubsequentHeaderError:
-				return nil, NewReadError(e.Error())
-			default:
-				return nil, err
-			}
-		}
-		tarinfo = ti
-		break
-	}
-
-	if tarinfo != nil && !tf.Stream {
-		tf.Members = append(tf.Members, tarinfo)
-	} else {
-		tf.Loaded = true
-	}
-	return tarinfo, nil
+	return tf.next()
 }
 
 // Helper methods
@@ -608,9 +562,9 @@ func (tf *TarFile) getMember(name string) *TarInfo {
 }
 
 func (tf *TarFile) load() {
-	if !tf.Stream {
+	if !tf.stream {
 		for {
-			ti, err := tf.Next()
+			ti, err := tf.next() // 调用内部方法，不获取锁
 			if err != nil {
 				break // 或根据错误类型处理
 			}
@@ -618,22 +572,22 @@ func (tf *TarFile) load() {
 				break
 			}
 		}
-		tf.Loaded = true
+		tf.loaded = true
 	}
 }
 
 func (tf *TarFile) check(mode string) error {
-	if tf.Closed {
+	if tf.closed {
 		return fmt.Errorf("TarFile is closed")
 	}
-	if mode != "" && !strings.Contains(mode, tf.Mode) {
-		return fmt.Errorf("bad operation for mode %q", tf.Mode)
+	if mode != "" && !strings.Contains(mode, tf.mode) {
+		return fmt.Errorf("bad operation for mode %q", tf.mode)
 	}
 	return nil
 }
 
 func (tf *TarFile) dbg(level int, msg string) {
-	if level <= tf.Debug {
+	if level <= tf.debug {
 		fmt.Fprintf(os.Stderr, "%s\n", msg)
 	}
 }
@@ -662,4 +616,341 @@ func osMode(mode string) int {
 func tell(r io.Seeker) int64 {
 	pos, _ := r.Seek(0, io.SeekCurrent)
 	return pos
+}
+
+// 公开的访问器方法，提供并发安全的字段访问
+
+// GetName returns the name of the tar file
+func (tf *TarFile) GetName() string {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.name
+}
+
+// GetMode returns the mode of the tar file
+func (tf *TarFile) GetMode() string {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.mode
+}
+
+// GetDebug returns the debug level
+func (tf *TarFile) GetDebug() int {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.debug
+}
+
+// SetDebug sets the debug level
+func (tf *TarFile) SetDebug(level int) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	tf.debug = level
+}
+
+// GetDereference returns the dereference setting
+func (tf *TarFile) GetDereference() bool {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.dereference
+}
+
+// SetDereference sets the dereference setting
+func (tf *TarFile) SetDereference(dereference bool) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	tf.dereference = dereference
+}
+
+// GetIgnoreZeros returns the ignore zeros setting
+func (tf *TarFile) GetIgnoreZeros() bool {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.ignoreZeros
+}
+
+// SetIgnoreZeros sets the ignore zeros setting
+func (tf *TarFile) SetIgnoreZeros(ignoreZeros bool) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	tf.ignoreZeros = ignoreZeros
+}
+
+// GetErrorLevel returns the error level
+func (tf *TarFile) GetErrorLevel() int {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.errorLevel
+}
+
+// SetErrorLevel sets the error level
+func (tf *TarFile) SetErrorLevel(level int) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	tf.errorLevel = level
+}
+
+// GetFormat returns the archive format
+func (tf *TarFile) GetFormat() int {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.format
+}
+
+// SetFormat sets the archive format
+func (tf *TarFile) SetFormat(format int) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	tf.format = format
+}
+
+// GetEncoding returns the encoding
+func (tf *TarFile) GetEncoding() string {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.encoding
+}
+
+// SetEncoding sets the encoding
+func (tf *TarFile) SetEncoding(encoding string) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	tf.encoding = encoding
+}
+
+// GetErrors returns the error handler
+func (tf *TarFile) GetErrors() string {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.errors
+}
+
+// SetErrors sets the error handler
+func (tf *TarFile) SetErrors(errors string) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	tf.errors = errors
+}
+
+// GetPaxHeaders returns a copy of the PAX headers
+func (tf *TarFile) GetPaxHeaders() map[string]string {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	headers := make(map[string]string)
+	for k, v := range tf.paxHeaders {
+		headers[k] = v
+	}
+	return headers
+}
+
+// SetPaxHeaders sets the PAX headers
+func (tf *TarFile) SetPaxHeaders(headers map[string]string) {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	tf.paxHeaders = make(map[string]string)
+	for k, v := range headers {
+		tf.paxHeaders[k] = v
+	}
+}
+
+// IsClosed returns whether the archive is closed
+func (tf *TarFile) IsClosed() bool {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.closed
+}
+
+// IsLoaded returns whether all members are loaded
+func (tf *TarFile) IsLoaded() bool {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.loaded
+}
+
+// GetOffset returns the current position in the archive
+func (tf *TarFile) GetOffset() int64 {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.offset
+}
+
+// IsStream returns whether the archive is treated as a stream
+func (tf *TarFile) IsStream() bool {
+	tf.mu.RLock()
+	defer tf.mu.RUnlock()
+	return tf.stream
+}
+
+// next is the internal implementation without locking (assumes lock is held)
+func (tf *TarFile) next() (*TarInfo, error) {
+	tf.check("ra")
+	if tf.firstMember != nil {
+		m := tf.firstMember
+		tf.firstMember = nil
+		return m, nil
+	}
+
+	if tf.offset != tell(tf.fileObj) {
+		if tf.offset == 0 {
+			return nil, nil
+		}
+		if _, err := tf.fileObj.Seek(tf.offset-1, io.SeekStart); err != nil {
+			return nil, err
+		}
+		b := make([]byte, 1)
+		if _, err := tf.fileObj.Read(b); err != nil {
+			return nil, NewReadError("unexpected end of data")
+		}
+	}
+
+	var tarinfo *TarInfo
+	for {
+		ti, err := tf.tarInfo().FromTarFile(tf)
+		if err != nil {
+			switch e := err.(type) {
+			case *EOFHeaderError:
+				if tf.ignoreZeros {
+					tf.dbg(2, fmt.Sprintf("0x%X: %s", tf.offset, e))
+					tf.offset += BLOCKSIZE
+					continue
+				}
+			case *InvalidHeaderError:
+				if tf.ignoreZeros {
+					tf.dbg(2, fmt.Sprintf("0x%X: %s", tf.offset, e))
+					tf.offset += BLOCKSIZE
+					continue
+				}
+				if tf.offset == 0 {
+					return nil, NewReadError(e.Error())
+				}
+			case *EmptyHeaderError:
+				if tf.offset == 0 {
+					return nil, NewReadError("empty file")
+				}
+			case *TruncatedHeaderError:
+				if tf.offset == 0 {
+					return nil, NewReadError(e.Error())
+				}
+			case *SubsequentHeaderError:
+				return nil, NewReadError(e.Error())
+			default:
+				return nil, err
+			}
+		}
+		tarinfo = ti
+		break
+	}
+
+	if tarinfo != nil && !tf.stream {
+		tf.members = append(tf.members, tarinfo)
+	} else {
+		tf.loaded = true
+	}
+	return tarinfo, nil
+}
+
+// Extract extracts a member from the archive to the specified path
+func (tf *TarFile) Extract(member *TarInfo, path string) error {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+
+	if err := tf.check("r"); err != nil {
+		return err
+	}
+
+	return tf.extractMember(member, path)
+}
+
+// ExtractAll extracts all members from the archive to the specified path
+func (tf *TarFile) ExtractAll(path string) error {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+
+	if err := tf.check("r"); err != nil {
+		return err
+	}
+
+	members, err := tf.getMembers()
+	if err != nil {
+		return err
+	}
+
+	for _, member := range members {
+		if err := tf.extractMember(member, path); err != nil {
+			return fmt.Errorf("failed to extract %s: %w", member.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// extractMember is the internal implementation for extracting a member
+func (tf *TarFile) extractMember(member *TarInfo, basePath string) error {
+	targetPath := filepath.Join(basePath, member.Name)
+
+	// 确保目标目录存在
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		return err
+	}
+
+	switch {
+	case member.IsDir():
+		return os.MkdirAll(targetPath, os.FileMode(member.Mode))
+
+	case member.IsReg():
+		return tf.extractFile(member, targetPath)
+
+	case member.IsSym():
+		return os.Symlink(member.Linkname, targetPath)
+
+	case member.IsLnk():
+		linkTarget := filepath.Join(basePath, member.Linkname)
+		return os.Link(linkTarget, targetPath)
+
+	default:
+		// 对于设备文件、FIFO等，我们暂时跳过
+		tf.dbg(1, fmt.Sprintf("Skipping special file %s (type: %s)", member.Name, member.Type))
+		return nil
+	}
+}
+
+// extractFile extracts a regular file
+func (tf *TarFile) extractFile(member *TarInfo, targetPath string) error {
+	// 移动到数据的开始位置
+	if _, err := tf.fileObj.Seek(member.OffsetData, io.SeekStart); err != nil {
+		return err
+	}
+
+	// 创建目标文件
+	outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(member.Mode))
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	// 复制数据
+	_, err = io.CopyN(outFile, tf.fileObj, member.Size)
+	if err != nil {
+		return err
+	}
+
+	// 设置修改时间
+	return os.Chtimes(targetPath, member.Mtime, member.Mtime)
+}
+
+// getMembers is the internal implementation without locking
+func (tf *TarFile) getMembers() ([]*TarInfo, error) {
+	if !tf.loaded {
+		tf.load()
+	}
+	return tf.members, nil
+}
+
+// extractTo is a convenience method that extracts a named member
+func (tf *TarFile) ExtractTo(memberName, targetPath string) error {
+	member, err := tf.GetMember(memberName)
+	if err != nil {
+		return err
+	}
+	return tf.Extract(member, targetPath)
 }

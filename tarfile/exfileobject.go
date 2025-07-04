@@ -25,10 +25,10 @@ func (ef *ExFileObject) Read(p []byte) (int, error) {
 	if ef.pos >= ef.ti.Size {
 		return 0, io.EOF
 	}
-	if _, err := ef.tf.FileObj.Seek(ef.offset+ef.pos, io.SeekStart); err != nil {
+	if _, err := ef.tf.fileObj.Seek(ef.offset+ef.pos, io.SeekStart); err != nil {
 		return 0, err
 	}
-	n, err := ef.tf.FileObj.Read(p)
+	n, err := ef.tf.fileObj.Read(p)
 	if err != nil && err != io.EOF {
 		return n, err
 	}

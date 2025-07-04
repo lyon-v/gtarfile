@@ -159,6 +159,12 @@ func (ti *TarInfo) ToBuf(format int, encoding, errors string) ([]byte, error) {
 
 func (ti *TarInfo) createUstarHeader(info map[string]interface{}, encoding, errors string) ([]byte, error) {
 	info["magic"] = POSIX_MAGIC
+
+	// 初始化prefix字段
+	if _, exists := info["prefix"]; !exists {
+		info["prefix"] = ""
+	}
+
 	if len(info["linkname"].(string)) > LENGTH_LINK {
 		return nil, fmt.Errorf("linkname is too long")
 	}
@@ -175,6 +181,12 @@ func (ti *TarInfo) createUstarHeader(info map[string]interface{}, encoding, erro
 
 func (ti *TarInfo) createGnuHeader(info map[string]interface{}, encoding, errors string) ([]byte, error) {
 	info["magic"] = GNU_MAGIC
+
+	// 初始化prefix字段
+	if _, exists := info["prefix"]; !exists {
+		info["prefix"] = ""
+	}
+
 	buf := []byte{}
 	if len(info["linkname"].(string)) > LENGTH_LINK {
 		longLink, err := ti.createGnuLongHeader(info["linkname"].(string), GNUTYPE_LONGLINK, encoding, errors)
@@ -199,6 +211,12 @@ func (ti *TarInfo) createGnuHeader(info map[string]interface{}, encoding, errors
 
 func (ti *TarInfo) createPaxHeader(info map[string]interface{}, encoding string) ([]byte, error) {
 	info["magic"] = POSIX_MAGIC
+
+	// 初始化prefix字段
+	if _, exists := info["prefix"]; !exists {
+		info["prefix"] = ""
+	}
+
 	paxHeaders := make(map[string]string)
 	for k, v := range ti.PaxHeaders {
 		paxHeaders[k] = v
@@ -234,28 +252,48 @@ func (ti *TarInfo) createPaxHeader(info map[string]interface{}, encoding string)
 
 	// 处理数字字段
 	for name, digits := range map[string]int{
+		"mode":  8,
 		"uid":   8,
 		"gid":   8,
 		"size":  12,
 		"mtime": 12,
 	} {
 		if name == "mtime" {
-			continue // Handle mtime separately
-		}
-		val := info[name].(int)
-		if val < 0 || val >= int(math.Pow(8, float64(digits-1))) {
-			info[name] = 0
-			if _, ok := paxHeaders[name]; !ok {
-				paxHeaders[name] = strconv.Itoa(val)
+			// Handle mtime as int64
+			mtime := info[name].(int64)
+			if mtime < 0 || mtime >= int64(math.Pow(8, float64(digits-1))) {
+				info[name] = int64(0)
+				if _, ok := paxHeaders[name]; !ok {
+					paxHeaders[name] = strconv.FormatInt(mtime, 10)
+				}
 			}
-		}
-	}
-	// Handle mtime as int64
-	mtime := info["mtime"].(int64)
-	if mtime < 0 || mtime >= int64(math.Pow(8, 11)) {
-		info["mtime"] = int64(0)
-		if _, ok := paxHeaders["mtime"]; !ok {
-			paxHeaders["mtime"] = strconv.FormatInt(mtime, 10)
+		} else if name == "size" {
+			// Handle size as int64
+			size := info[name].(int64)
+			if size < 0 || size >= int64(math.Pow(8, float64(digits-1))) {
+				info[name] = int64(0)
+				if _, ok := paxHeaders[name]; !ok {
+					paxHeaders[name] = strconv.FormatInt(size, 10)
+				}
+			}
+		} else if name == "mode" {
+			// Handle mode as int64
+			mode := info[name].(int64)
+			if mode < 0 || mode >= int64(math.Pow(8, float64(digits-1))) {
+				info[name] = int64(0)
+				if _, ok := paxHeaders[name]; !ok {
+					paxHeaders[name] = strconv.FormatInt(mode, 10)
+				}
+			}
+		} else {
+			// Handle uid, gid as int
+			val := info[name].(int)
+			if val < 0 || val >= int(math.Pow(8, float64(digits-1))) {
+				info[name] = 0
+				if _, ok := paxHeaders[name]; !ok {
+					paxHeaders[name] = strconv.Itoa(val)
+				}
+			}
 		}
 	}
 
@@ -372,10 +410,21 @@ func (ti *TarInfo) createHeader(info map[string]interface{}, format int, encodin
 func (ti *TarInfo) createGnuLongHeader(name, typ, encoding, errors string) ([]byte, error) {
 	nameBytes := append([]byte(name), NUL)
 	info := map[string]interface{}{
-		"name":  "././@LongLink",
-		"type":  typ,
-		"size":  int64(len(nameBytes)),
-		"magic": GNU_MAGIC,
+		"name":     "././@LongLink",
+		"mode":     int64(0),
+		"uid":      0,
+		"gid":      0,
+		"size":     int64(len(nameBytes)),
+		"mtime":    int64(0),
+		"chksum":   0,
+		"type":     typ,
+		"linkname": "",
+		"magic":    GNU_MAGIC,
+		"uname":    "",
+		"gname":    "",
+		"devmajor": 0,
+		"devminor": 0,
+		"prefix":   "",
 	}
 	header, err := ti.createHeader(info, USTAR_FORMAT, encoding, errors)
 	if err != nil {
@@ -420,10 +469,21 @@ func (ti *TarInfo) createPaxGenericHeader(paxHeaders map[string]string, typ, enc
 	}
 
 	info := map[string]interface{}{
-		"name":  "././@PaxHeader",
-		"type":  typ,
-		"size":  int64(len(records)),
-		"magic": POSIX_MAGIC,
+		"name":     "././@PaxHeader",
+		"mode":     int64(0),
+		"uid":      0,
+		"gid":      0,
+		"size":     int64(len(records)),
+		"mtime":    int64(0),
+		"chksum":   0,
+		"type":     typ,
+		"linkname": "",
+		"magic":    POSIX_MAGIC,
+		"uname":    "",
+		"gname":    "",
+		"devmajor": 0,
+		"devminor": 0,
+		"prefix":   "",
 	}
 	header, err := ti.createHeader(info, USTAR_FORMAT, "ascii", "replace")
 	if err != nil {
@@ -444,7 +504,7 @@ func (ti *TarInfo) createPayload(payload []byte) []byte {
 // FromTarFile reads a TarInfo from the TarFile's current position.
 func (ti *TarInfo) FromTarFile(tf *TarFile) (*TarInfo, error) {
 	buf := make([]byte, BLOCKSIZE)
-	n, err := tf.FileObj.Read(buf)
+	n, err := tf.fileObj.Read(buf)
 	if err != nil {
 		if err == io.EOF && n == 0 {
 			return nil, NewEOFHeaderError("end of file header")
@@ -455,13 +515,13 @@ func (ti *TarInfo) FromTarFile(tf *TarFile) (*TarInfo, error) {
 		return nil, NewTruncatedHeaderError("truncated header")
 	}
 
-	ti, err = FromBuf(buf, tf.Encoding, tf.Errors)
+	ti, err = FromBuf(buf, tf.encoding, tf.errors)
 	if err != nil {
 		return nil, err
 	}
-	ti.Offset = tf.Offset
-	ti.OffsetData = tf.Offset + BLOCKSIZE
-	tf.Offset += BLOCKSIZE
+	ti.Offset = tf.offset
+	ti.OffsetData = tf.offset + BLOCKSIZE
+	tf.offset += BLOCKSIZE
 	return ti, nil
 }
 
