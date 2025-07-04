@@ -1,81 +1,181 @@
-## Overview
+# GTarFile - Go语言TAR文件处理库
 
-gtarfile is a Golang library inspired by Python's tarfile module. It provides functionality to read, write, and manipulate tar archives, built on top of the archiver/tar package. This project aims to replicate the core features of Python's tarfile.TarFile and tarinfo.TarInfo classes, offering a lightweight and efficient alternative for tar file handling in Go.
+[![Go Version](https://img.shields.io/badge/Go-%3E%3D1.19-blue.svg)](https://golang.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
-## Features
+一个高性能、线程安全的Go语言TAR文件处理库，完整模仿Python tarfile模块的API和功能。
 
-- Create, read, and extract tar archives.
-- Support for TarFile-like operations (open, extract, add files, etc.).
-- Implementation of TarInfo for metadata handling (file name, size, permissions, etc.).
-- Built with simplicity and performance in mind.
+## ✨ 特性
 
-## Installation
+- 🔒 **线程安全** - 完整的并发保护，支持多goroutine安全访问
+- 📦 **功能完整** - 支持创建、读取、提取TAR文件的所有核心功能
+- 🛡️ **类型安全** - 严格的类型检查和错误处理
+- ⚡ **高性能** - 优化的文件I/O操作和内存管理
+- 📏 **标准兼容** - 完全符合POSIX TAR格式标准
+- 🔧 **易于使用** - 简洁直观的API设计
+- 🗜️ **压缩支持** - 支持gzip、bzip2、xz压缩格式
 
-To use gtarfile in your project, ensure you have Go installed, then run:
+## 🎯 使用场景
 
-bash
+### 备份和归档
+- 系统文件备份
+- 日志文件归档
+- 数据库备份压缩
 
-CollapseWrapCopy
+### 软件分发
+- 应用程序打包
+- 依赖库分发
+- 容器镜像构建
 
+### 数据传输
+- 批量文件传输
+- 网络文件同步
+- 云存储上传下载
+
+### 开发工具
+- 构建系统集成
+- CI/CD流水线
+- 自动化部署脚本
+
+## 🚀 快速开始
+
+### 安装
+
+```bash
+go get github.com/yourusername/gtarfile
 ```
-go get github.com/lyon-v/gtarfile
-```
 
-## Usage
+### 基本使用
 
-Here’s a basic example of how to use gtarfile:
-
-go
-
-CollapseWrapCopy
-
-```
+```go
 package main
 
 import (
     "fmt"
-    "github.com/lyon-v/gtarfile"
+    "log"
+    "gtarfile/tarfile"
 )
 
 func main() {
-    // Open an existing tar file
-    tf, err := gtarfile.Open("example.tar", "r")
+    // 创建TAR文件
+    tf, err := tarfile.Open("archive.tar", "w", nil, 4096)
     if err != nil {
-        fmt.Println("Error:", err)
-        return
+        log.Fatal(err)
     }
     defer tf.Close()
 
-    // List all files in the tar archive
-    for _, info := range tf.GetMembers() {
-        fmt.Printf("File: %s, Size: %d bytes\n", info.Name, info.Size)
+    // 添加文件到归档
+    err = tf.Add("myfile.txt", "", false, nil)
+    if err != nil {
+        log.Fatal(err)
     }
 
-    // Extract all files
-    err = tf.ExtractAll("./output")
-    if err != nil {
-        fmt.Println("Error extracting:", err)
-    }
+    fmt.Println("TAR文件创建成功!")
 }
 ```
 
-## Development Status
+## 📚 核心功能
 
-This project is under active development. Current goals include:
+### 1. TAR文件创建
+- 创建新的TAR归档文件
+- 添加文件和目录到归档
+- 支持递归添加目录结构
+- 自定义文件过滤器
 
-1. Full implementation of TarFile class with read/write support.
-2. Complete TarInfo class for detailed file metadata.
-3. Support for compression (e.g., gzip) in future releases.
+### 2. TAR文件读取
+- 读取现有TAR文件
+- 遍历归档成员
+- 获取文件元数据信息
+- 流式读取支持
 
-## Contributing
+### 3. TAR文件提取
+- 提取单个文件
+- 批量提取所有文件
+- 保持文件权限和时间戳
+- 支持符号链接和硬链接
 
-Contributions are welcome! Feel free to submit issues or pull requests to the repository.
+### 4. 压缩格式支持
+- `.tar` - 无压缩TAR文件
+- `.tar.gz` / `.tgz` - Gzip压缩
+- `.tar.bz2` - Bzip2压缩  
+- `.tar.xz` - XZ压缩
 
-## License
+### 5. 高级特性
+- PAX扩展头支持
+- GNU TAR格式兼容
+- 稀疏文件处理
+- 大文件支持（>8GB）
 
-This project is licensed under the [MIT License](LICENSE). See the [LICENSE](LICENSE) file for details.
+## 🔧 API参考
 
-## Acknowledgments
+### 主要类型
 
-- Built using the archiver/tar package from the Go ecosystem.
-- Inspired by Python's tarfile module.
+```go
+// TarFile - TAR文件操作对象
+type TarFile struct {
+    // ... 私有字段
+}
+
+// TarInfo - TAR文件成员信息
+type TarInfo struct {
+    Name     string    // 文件名
+    Size     int64     // 文件大小
+    Mode     int64     // 权限模式
+    Mtime    time.Time // 修改时间
+    Type     string    // 文件类型
+    // ... 其他字段
+}
+```
+
+### 主要方法
+
+```go
+// 打开TAR文件
+func Open(name, mode string, fileobj io.ReadWriteSeeker, bufsize int) (*TarFile, error)
+
+// 添加文件到归档
+func (tf *TarFile) Add(name, arcname string, recursive bool, filter func(*TarInfo) (*TarInfo, error)) error
+
+// 获取所有成员
+func (tf *TarFile) GetMembers() ([]*TarInfo, error)
+
+// 提取文件
+func (tf *TarFile) Extract(member *TarInfo, path string) error
+
+// 提取所有文件
+func (tf *TarFile) ExtractAll(path string) error
+```
+
+## 📖 详细文档
+
+更多详细使用案例和API文档请查看 [docs](./docs/) 目录：
+
+- [安装指南](./docs/installation.md)
+- [基础教程](./docs/basic-tutorial.md)
+- [高级用法](./docs/advanced-usage.md)
+- [API文档](./docs/api-reference.md)
+- [性能优化](./docs/performance.md)
+
+## 🤝 贡献
+
+欢迎提交Issue和Pull Request来帮助改进这个项目！
+
+1. Fork 这个仓库
+2. 创建你的特性分支 (`git checkout -b feature/AmazingFeature`)
+3. 提交你的修改 (`git commit -m 'Add some AmazingFeature'`)
+4. 推送到分支 (`git push origin feature/AmazingFeature`)
+5. 开启一个Pull Request
+
+## 📄 许可证
+
+这个项目使用 MIT 许可证。查看 [LICENSE](LICENSE) 文件了解详情。
+
+## 🙏 致谢
+
+- 灵感来源于Python的 [tarfile](https://docs.python.org/3/library/tarfile.html) 模块
+- 感谢Go语言社区的支持和贡献
+
+---
+
+**如果这个项目对您有帮助，请给个⭐️支持一下！**
